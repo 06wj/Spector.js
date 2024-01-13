@@ -1,7 +1,10 @@
 import preprocess from "@shaderfrog/glsl-parser/preprocessor"; // tslint:disable-line:no-submodule-imports
+import * as GLSLParser from "@shaderfrog/glsl-parser"; // tslint:disable-line:no-submodule-imports
+import { FunctionCallNode, FunctionNode, IdentifierNode, Path, TypeSpecifierNode, visit } from "@shaderfrog/glsl-parser/ast"; // tslint:disable-line:no-submodule-imports
 import { BaseComponent, IStateEvent } from "../../mvx/baseComponent";
 import { ISourceCodeChangeEvent } from "../resultView";
 import { Logger } from "../../../shared/utils/logger";
+
 
 export interface ISourceCodeState extends ISourceCodeChangeEvent {
     nameVertex: string;
@@ -105,10 +108,13 @@ export class SourceCodeComponent extends BaseComponent<ISourceCodeState> {
         let displayedShader = originalShader;
         if (preprocessed) {
             try {
+                displayedShader = displayedShader.replace(/[\r]/g, "\n");
                 displayedShader = preprocess(displayedShader, {
                     preserveComments: false,
                     stopOnError: true
                 });
+
+                displayedShader = this._removeUnusedFunctions(displayedShader);
             } catch (e) {
                 Logger.error("shader preprocess failed", e);
             }
@@ -345,5 +351,104 @@ export class SourceCodeComponent extends BaseComponent<ISourceCodeState> {
             }
         }
         return arr2.join("\n");
+    }
+
+    private _removeUnusedFunctions(shaderCode: string): string {
+        const ast = GLSLParser.parser.parse(shaderCode, {
+            quiet: true,
+        });
+        const getFunctionName = (path: Path<FunctionNode | FunctionCallNode>): string => {
+            const node = path.node;
+            let nameNode;
+            switch (node.type) {
+                case "function":
+                    nameNode = node.prototype.header.name;
+                    break;
+                case "function_call":
+                    const identifierNode = node.identifier;
+                    switch (identifierNode.type) {
+                        case "postfix":
+                            nameNode = (identifierNode.expression as any)?.identifier?.specifier;
+                            break;
+                        case "type_specifier":
+                            nameNode = identifierNode.specifier;
+                            break;
+                        case "identifier":
+                            break;
+                    }
+                    break;
+            }
+
+            switch (nameNode?.type) {
+                case "keyword":
+                    return nameNode.token;
+                case "identifier":
+                    return nameNode.identifier;
+                case "type_name":
+                    return nameNode.identifier;
+            }
+
+            return "";
+        };
+
+        const globalCallMap: any = {};
+        let currentFunctionMap: {
+            called: boolean;
+            callMap: any;
+        };
+        visit(ast, {
+            function: {
+                enter: (path) => {
+                    const functionName = getFunctionName(path);
+                    currentFunctionMap = globalCallMap[functionName] = {
+                        called: false,
+                        callMap: {},
+                    };
+                },
+                exit: (path) => {
+                    currentFunctionMap = null;
+                },
+            },
+            function_call: {
+                enter: (path) => {
+                    const functionName = getFunctionName(path);
+                    if (currentFunctionMap) {
+                        currentFunctionMap.callMap[functionName] = true;
+                    }
+                }
+            },
+        });
+
+        function calledByMainFunction(functionName: string) {
+            const functionMap = globalCallMap[functionName];
+            if (!functionMap) {
+                return;
+            }
+            functionMap.called = true;
+            const { callMap } = functionMap;
+            const names = Object.keys(callMap);
+            names.forEach(calledName => {
+                calledByMainFunction(calledName);
+            });
+        }
+        calledByMainFunction("main");
+
+        visit(ast, {
+            function: {
+                enter: (path) => {
+                    const functionName = getFunctionName(path);
+                    const functionMap = globalCallMap[functionName];
+                    if (!functionMap) {
+                        return;
+                    }
+                    if (functionMap.called === false) {
+                        path.remove();
+                    }
+                }
+            },
+        });
+
+        const newShaderCode = GLSLParser.generate(ast);
+        return newShaderCode;
     }
 }
